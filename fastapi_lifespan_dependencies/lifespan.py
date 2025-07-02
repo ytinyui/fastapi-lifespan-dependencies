@@ -1,7 +1,7 @@
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import (
-    AbstractContextManager,
     AbstractAsyncContextManager,
+    AbstractContextManager,
     AsyncExitStack,
     asynccontextmanager,
     contextmanager,
@@ -12,6 +12,7 @@ from typing import Any, Callable
 from fastapi import FastAPI
 from fastapi.concurrency import contextmanager_in_threadpool
 from fastapi.dependencies.utils import (
+    _should_embed_body_fields,
     get_dependant,
     solve_dependencies,
 )
@@ -55,16 +56,15 @@ class Lifespan:
                     }
                 )
 
-                (
-                    solved_values,
-                    errors,
-                    background_tasks,
-                    *_,
-                ) = await solve_dependencies(
+                solved_dependency = await solve_dependencies(
                     request=initial_state_request,
                     dependant=dependant,
                     async_exit_stack=exit_stack,
+                    embed_body_fields=_should_embed_body_fields(dependant.body_params),
                 )
+                solved_values = solved_dependency.values
+                errors = solved_dependency.errors
+                background_tasks = solved_dependency.background_tasks
 
                 if background_tasks is not None:
                     raise LifespanDependencyError(
