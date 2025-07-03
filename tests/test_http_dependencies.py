@@ -1,18 +1,18 @@
-from typing import Annotated, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Annotated
+
+import pytest
 from asgi_lifespan import LifespanManager
 from fastapi import Depends, FastAPI
-
 from fastapi.testclient import TestClient
-import pytest
 
 from .dependencies import (
+    dependent,
     lifespan,
     lifespan_dependency,
-    dependent,
     lifespan_dependent,
     sync_lifespan_dependency,
 )
-
 
 app = FastAPI(lifespan=lifespan)
 
