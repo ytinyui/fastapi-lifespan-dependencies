@@ -1,4 +1,5 @@
-from collections.abc import AsyncIterator, Iterator, Mapping
+from asyncio import Task, TaskGroup
+from collections.abc import AsyncIterator, Awaitable, Coroutine, Iterator, Mapping
 from contextlib import (
     AbstractAsyncContextManager,
     AbstractContextManager,
@@ -6,11 +7,16 @@ from contextlib import (
     asynccontextmanager,
     contextmanager,
 )
-from inspect import isasyncgenfunction, isgeneratorfunction
+from inspect import (
+    isasyncgenfunction,
+    iscoroutinefunction,
+    isfunction,
+    isgeneratorfunction,
+)
 from typing import Any, Callable
 
 from fastapi import FastAPI
-from fastapi.concurrency import contextmanager_in_threadpool
+from fastapi.concurrency import contextmanager_in_threadpool, run_in_threadpool
 from fastapi.dependencies.utils import (
     _should_embed_body_fields,
     get_dependant,
@@ -21,7 +27,7 @@ from starlette.requests import HTTPConnection, Request
 from fastapi_lifespan_dependencies.exceptions import LifespanDependencyError
 
 LifespanDependency = Callable[
-    ..., AbstractAsyncContextManager[Any] | AbstractContextManager[Any]
+    ..., AbstractAsyncContextManager[Any] | AbstractContextManager[Any] | Any
 ]
 
 
@@ -39,13 +45,15 @@ async def _run_dependency[R](
 class Lifespan:
     def __init__(self) -> None:
         self.dependencies: dict[str, LifespanDependency] = {}
+        self.tasks: dict[str, Task[Any]] = {}
 
     @asynccontextmanager
     async def __call__(self, app: FastAPI) -> AsyncIterator[Mapping[str, Any]]:
         state: dict[str, Any] = {}
 
         async with AsyncExitStack() as exit_stack:
-            for name, dependency in self.dependencies.items():
+
+            async def init_dependency(name: str, dependency: Callable[..., Any]):
                 dependant = get_dependant(path="", call=dependency)
                 initial_state_request = Request(
                     scope={
@@ -74,25 +82,41 @@ class Lifespan:
                 if len(errors) > 0:
                     raise LifespanDependencyError(errors)
 
-                state[name] = await _run_dependency(
-                    exit_stack, dependency(**solved_values)
-                )
+                solved_dependency = await run_in_threadpool(dependency, **solved_values)
+                if isinstance(
+                    solved_dependency, AbstractAsyncContextManager
+                ) or isinstance(solved_dependency, AbstractContextManager):
+                    state[name] = await _run_dependency(exit_stack, solved_dependency)
+                elif isinstance(solved_dependency, Coroutine):
+                    state[name] = await solved_dependency
+                else:
+                    state[name] = solved_dependency
 
+            async with TaskGroup() as group:
+                for name, dependency in self.dependencies.items():
+                    self.tasks[name] = group.create_task(
+                        init_dependency(name, dependency)
+                    )
             yield state
 
     def register[R](
-        self, dependency: Callable[..., AsyncIterator[R] | Iterator[R]]
-    ) -> Callable[[HTTPConnection], R]:
+        self, dependency: Callable[..., R | AsyncIterator[R] | Iterator[R]]
+    ) -> Callable[[HTTPConnection], Awaitable[R]]:
         if isasyncgenfunction(dependency):
             context_manager = asynccontextmanager(dependency)
         elif isgeneratorfunction(dependency):
             context_manager = contextmanager(dependency)
+        elif iscoroutinefunction(dependency) or isfunction(dependency):
+            context_manager = dependency
         else:
-            raise TypeError(f"{dependency.__name__} is not a context manager")
+            raise TypeError(f"Unsupported dependency type: {type(dependency).__name__}")
 
-        self.dependencies[dependency.__name__] = context_manager
+        name = f"{dependency.__module__}.{dependency.__qualname__}"
+        self.dependencies[name] = context_manager
 
-        def path_dependency(connection: HTTPConnection) -> Any:
-            return getattr(connection.state, dependency.__name__)
+        async def path_dependency(connection: HTTPConnection) -> Any:
+            if not hasattr(connection.state, name):
+                await self.tasks[name]
+            return getattr(connection.state, name)
 
         return path_dependency
