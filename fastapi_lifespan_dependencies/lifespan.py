@@ -98,11 +98,12 @@ class Lifespan:
         else:
             raise TypeError(f"{dependency.__name__} is not a context manager")
 
-        self.dependencies[dependency.__name__] = context_manager
+        name = f"{dependency.__module__}.{dependency.__qualname__}"
+        self.dependencies[name] = context_manager
 
         async def path_dependency(connection: HTTPConnection) -> Any:
-            if not hasattr(connection.state, dependency.__name__):
-                await self.tasks[dependency.__name__]
-            return getattr(connection.state, dependency.__name__)
+            if not hasattr(connection.state, name):
+                await self.tasks[name]
+            return getattr(connection.state, name)
 
         return path_dependency
