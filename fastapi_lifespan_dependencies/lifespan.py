@@ -1,5 +1,5 @@
 from asyncio import Task, TaskGroup
-from collections.abc import AsyncIterator, Awaitable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Coroutine, Iterator, Mapping
 from contextlib import (
     AbstractAsyncContextManager,
     AbstractContextManager,
@@ -7,11 +7,16 @@ from contextlib import (
     asynccontextmanager,
     contextmanager,
 )
-from inspect import isasyncgenfunction, isgeneratorfunction
+from inspect import (
+    isasyncgenfunction,
+    iscoroutinefunction,
+    isfunction,
+    isgeneratorfunction,
+)
 from typing import Any, Callable
 
 from fastapi import FastAPI
-from fastapi.concurrency import contextmanager_in_threadpool
+from fastapi.concurrency import contextmanager_in_threadpool, run_in_threadpool
 from fastapi.dependencies.utils import (
     get_dependant,
     solve_dependencies,
@@ -21,7 +26,7 @@ from starlette.requests import HTTPConnection, Request
 from fastapi_lifespan_dependencies.exceptions import LifespanDependencyError
 
 LifespanDependency = Callable[
-    ..., AbstractAsyncContextManager[Any] | AbstractContextManager[Any]
+    ..., AbstractAsyncContextManager[Any] | AbstractContextManager[Any] | Any
 ]
 
 
@@ -77,9 +82,15 @@ class Lifespan:
                 if len(errors) > 0:
                     raise LifespanDependencyError(errors)
 
-                state[name] = await _run_dependency(
-                    exit_stack, dependency(**solved_values)
-                )
+                solved_dependency = await run_in_threadpool(dependency, **solved_values)
+                if isinstance(
+                    solved_dependency, AbstractAsyncContextManager
+                ) or isinstance(solved_dependency, AbstractContextManager):
+                    state[name] = await _run_dependency(exit_stack, solved_dependency)
+                elif isinstance(solved_dependency, Coroutine):
+                    state[name] = await solved_dependency
+                else:
+                    state[name] = solved_dependency
 
             async with TaskGroup() as group:
                 for name, dependency in self.dependencies.items():
@@ -89,14 +100,16 @@ class Lifespan:
             yield state
 
     def register[R](
-        self, dependency: Callable[..., AsyncIterator[R] | Iterator[R]]
+        self, dependency: Callable[..., R | AsyncIterator[R] | Iterator[R]]
     ) -> Callable[[HTTPConnection], Awaitable[R]]:
         if isasyncgenfunction(dependency):
             context_manager = asynccontextmanager(dependency)
         elif isgeneratorfunction(dependency):
             context_manager = contextmanager(dependency)
+        elif iscoroutinefunction(dependency) or isfunction(dependency):
+            context_manager = dependency
         else:
-            raise TypeError(f"{dependency.__name__} is not a context manager")
+            raise TypeError(f"Unsupported dependency type: {type(dependency).__name__}")
 
         name = f"{dependency.__module__}.{dependency.__qualname__}"
         self.dependencies[name] = context_manager
